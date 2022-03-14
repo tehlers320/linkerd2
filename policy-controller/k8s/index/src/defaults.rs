@@ -1,13 +1,17 @@
+/*
 use crate::{ServerRx, ServerTx};
 use ahash::AHashMap as HashMap;
+*/
 use anyhow::{anyhow, Error, Result};
+/*
 use linkerd_policy_controller_core::{
     ClientAuthentication, ClientAuthorization, IdentityMatch, InboundServer, IpNet, NetworkMatch,
     ProxyProtocol,
 };
+    */
 use linkerd_policy_controller_k8s_api as k8s;
-use std::{collections::hash_map::Entry, hash::Hash};
-use tokio::{sync::watch, time};
+use std::hash::Hash;
+// use tokio::{sync::watch, time};
 
 /// Indicates the default behavior to apply when no Server is found for a port.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -24,13 +28,7 @@ pub enum DefaultPolicy {
     Deny,
 }
 
-/// Describes the default behavior for a pod-port to apply when no Server is found for a port.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub(crate) struct PortDefaults {
-    pub authenticated: bool,
-    pub opaque: bool,
-}
-
+/*
 /// Holds the watches for all default policies. These watches are initiated lazily and are never
 /// updated. `DefaultPolicyWatches` creates a watch as needed and holding its sender so that the
 /// receiver never observes the sender closing (or updating at all).
@@ -41,6 +39,14 @@ pub(crate) struct DefaultPolicyWatches {
 
     watches: HashMap<(DefaultPolicy, PortDefaults), (ServerTx, ServerRx)>,
 }
+
+/// Describes the default behavior for a pod-port to apply when no Server is found for a port.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) struct PortDefaults {
+    pub authenticated: bool,
+    pub opaque: bool,
+}
+ */
 
 // === impl DefaultPolicy ===
 
@@ -110,6 +116,7 @@ impl std::fmt::Display for DefaultPolicy {
     }
 }
 
+/*
 // === impl DefaultPolicyWatches ===
 
 impl DefaultPolicyWatches {
@@ -225,6 +232,7 @@ impl DefaultPolicyWatches {
         }
     }
 }
+*/
 
 #[cfg(test)]
 mod test {

@@ -23,7 +23,7 @@ pub async fn pods(idx: SharedIndex, events: impl Stream<Item = k8s::WatchEvent<k
                 match nsidx.apply_pod(
                     name,
                     pod.metadata.labels.into(),
-                    port_names(pod.spec),
+                    tcp_port_names(pod.spec),
                     default_policy,
                 ) {
                     Err(error) => tracing::error!(%error, "Illegal pod update"),
@@ -69,7 +69,7 @@ pub async fn pods(idx: SharedIndex, events: impl Stream<Item = k8s::WatchEvent<k
                     match idx.get_ns_or_default(&namespace).apply_pod(
                         name,
                         pod.metadata.labels.into(),
-                        port_names(pod.spec),
+                        tcp_port_names(pod.spec),
                         default_policy,
                     ) {
                         Err(error) => tracing::error!(%error, "Illegal pod update"),
@@ -112,17 +112,19 @@ pub async fn pods(idx: SharedIndex, events: impl Stream<Item = k8s::WatchEvent<k
     }
 }
 
-fn port_names(spec: Option<k8s::PodSpec>) -> HashMap<String, HashSet<u16>> {
+fn tcp_port_names(spec: Option<k8s::PodSpec>) -> HashMap<String, HashSet<u16>> {
     let mut port_names = HashMap::default();
     if let Some(spec) = spec {
         for container in spec.containers.into_iter() {
             if let Some(ports) = container.ports {
                 for port in ports.into_iter() {
-                    if let Some(name) = port.name {
-                        port_names
-                            .entry(name)
-                            .or_insert_with(HashSet::new)
-                            .insert(port.container_port as u16);
+                    if let None | Some("TCP") = port.protocol.as_deref() {
+                        if let Some(name) = port.name {
+                            port_names
+                                .entry(name)
+                                .or_insert_with(HashSet::new)
+                                .insert(port.container_port as u16);
+                        }
                     }
                 }
             }

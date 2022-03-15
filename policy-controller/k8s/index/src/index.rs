@@ -31,6 +31,7 @@ use linkerd_policy_controller_core::{
 use linkerd_policy_controller_k8s_api::{self as k8s, policy::server::Port};
 use parking_lot::RwLock;
 use std::{collections::hash_map::Entry, sync::Arc};
+use tokio::sync::watch;
 
 pub type SharedIndex = Arc<RwLock<Index>>;
 
@@ -46,13 +47,13 @@ pub struct Index {
 #[derive(Debug)]
 pub struct NamespaceIndex {
     /// Holds per-pod port indexes.
-    pods: HashMap<String, PodMeta>,
+    pods: HashMap<String, PodIndex>,
 
     /// Holds servers by-name
-    servers: HashMap<String, ServerMeta>,
+    servers: HashMap<String, Server>,
 
     /// Holds server authorizations by-name
-    server_authorizations: HashMap<String, ServerAuthorizationMeta>,
+    server_authorizations: HashMap<String, ServerAuthorization>,
 
     cluster_info: Arc<ClusterInfo>,
 }
@@ -63,32 +64,56 @@ pub enum ServerSelector {
     Selector(k8s::labels::Selector),
 }
 
+/// A pod's port index.
 #[derive(Debug)]
-struct PodMeta {
+struct PodIndex {
+    /// The pod's name.
     name: String,
+
+    /// The pod's labels. Used by `Server` pod selectors.
     labels: k8s::Labels,
-    port_names: HashMap<String, HashSet<u16>>,
-    port_servers: HashMap<u16, PodPortServer>,
+
+    /// The default policy for this pod. This may be set by a pod annotation or it may be derived
+    /// from the cluster-wide default.
     default_policy: DefaultPolicy,
+
+    /// The pod's named container ports. Used by `Server` port selectors.
+    ///
+    /// A pod may have multiple ports with the same name. E.g., each container may have its own
+    /// `admin-http` port.
+    port_names: HashMap<String, HashSet<u16>>,
+
+    /// All known TCP server ports. This may be updated by `NamespaceIndex::reindex`--when a port is
+    /// selected by a `Server`--or by `NamespaceIndex::get_pod_server` when a client discovers a
+    /// port that has no configured server (and i.e. uses the default policy).
+    port_servers: HashMap<u16, PodPortServer>,
 }
 
 #[derive(Debug)]
 struct PodPortServer {
+    /// The name of the server resource that matches this port. Unset when no server resources match
+    /// this pod/port (and, i.e., the default policy is used).
     name: Option<String>,
-    tx: tokio::sync::watch::Sender<InboundServer>,
-    rx: tokio::sync::watch::Receiver<InboundServer>,
+
+    /// A sender used to broadcast pod port server updates.
+    tx: watch::Sender<InboundServer>,
+
+    /// A receiver that is updated when the pod's server is updated.
+    rx: watch::Receiver<InboundServer>,
 }
 
+/// The important parts of a `Server` resource.
 #[derive(Debug, PartialEq)]
-struct ServerMeta {
+struct Server {
     labels: k8s::Labels,
     pod_selector: k8s::labels::Selector,
     port_ref: Port,
     protocol: ProxyProtocol,
 }
 
+/// The important parts of a `ServerAuthorization` resource.
 #[derive(Debug, PartialEq)]
-struct ServerAuthorizationMeta {
+struct ServerAuthorization {
     authz: ClientAuthorization,
     server_selector: ServerSelector,
 }
@@ -131,7 +156,7 @@ impl Index {
         ns: &str,
         pod: &str,
         port: u16,
-    ) -> Result<tokio::sync::watch::Receiver<InboundServer>> {
+    ) -> Result<watch::Receiver<InboundServer>> {
         let ns = self
             .namespaces
             .get_mut(ns)
@@ -149,6 +174,7 @@ impl Index {
 }
 
 impl NamespaceIndex {
+    /// Returns true if the index does not include any resources.
     pub fn is_empty(&self) -> bool {
         self.pods.is_empty() && self.servers.is_empty() && self.server_authorizations.is_empty()
     }
@@ -168,9 +194,10 @@ impl NamespaceIndex {
         let default_policy = default_policy.unwrap_or(self.cluster_info.default_policy);
 
         match self.pods.entry(name.to_string()) {
-            // Pod labels may change at runtime but the default policy and port sets may not.
             Entry::Occupied(pod) => {
                 let pod = pod.into_mut();
+
+                // Pod labels and annotations may change at runtime, but the port list may not
                 if pod.port_names != port_names {
                     anyhow::bail!("pod {} port names must not change", name.to_string());
                 }
@@ -189,12 +216,12 @@ impl NamespaceIndex {
             }
 
             Entry::Vacant(entry) => {
-                let name = entry.key().to_string();
-                entry.insert(PodMeta {
-                    name,
+                entry.insert(PodIndex {
+                    name: name.to_string(),
                     labels,
                     port_names,
                     default_policy,
+                    // Servers are updated by `reindex`.
                     port_servers: HashMap::default(),
                 });
                 Ok(true)
@@ -220,7 +247,7 @@ impl NamespaceIndex {
         port_ref: Port,
         protocol: ProxyProtocol,
     ) -> bool {
-        let meta = ServerMeta {
+        let meta = Server {
             labels,
             pod_selector,
             port_ref,
@@ -260,7 +287,7 @@ impl NamespaceIndex {
         server_selector: ServerSelector,
         authz: ClientAuthorization,
     ) -> bool {
-        let meta = ServerAuthorizationMeta {
+        let meta = ServerAuthorization {
             authz,
             server_selector,
         };
@@ -331,7 +358,7 @@ impl NamespaceIndex {
                 if ps.name.is_none()
                     && *ps.rx.borrow().name != format!("default:{}", pod.default_policy)
                 {
-                    let server = PodMeta::default_server(pod.default_policy, &*self.cluster_info);
+                    let server = default_server(pod.default_policy, &*self.cluster_info);
                     ps.tx.send(server).expect("receiver is held");
                 }
             }
@@ -339,10 +366,10 @@ impl NamespaceIndex {
     }
 
     fn associate_pod_with_server(
-        pod: &mut PodMeta,
+        pod: &mut PodIndex,
         port: u16,
         server: &InboundServer,
-        servers: &HashMap<String, ServerMeta>,
+        servers: &HashMap<String, Server>,
     ) -> Result<bool> {
         match pod.port_servers.entry(port) {
             Entry::Occupied(mut entry) => {
@@ -371,7 +398,7 @@ impl NamespaceIndex {
             }
 
             Entry::Vacant(entry) => {
-                let (tx, rx) = tokio::sync::watch::channel(server.clone());
+                let (tx, rx) = watch::channel(server.clone());
                 entry.insert(PodPortServer {
                     name: Some(server.name.clone()),
                     tx,
@@ -382,7 +409,7 @@ impl NamespaceIndex {
         }
     }
 
-    fn mk_inbound_server(&self, name: String, server: &ServerMeta) -> InboundServer {
+    fn mk_inbound_server(&self, name: String, server: &Server) -> InboundServer {
         let mut authorizations = HashMap::with_capacity(self.server_authorizations.len());
         for (sazname, saz) in self.server_authorizations.iter() {
             let matched = match &saz.server_selector {
@@ -405,11 +432,7 @@ impl NamespaceIndex {
     /// If the pod does not exist, an error is returned.
     ///
     /// If the port is not known, a default server is created.
-    fn get_pod_server(
-        &mut self,
-        name: &str,
-        port: u16,
-    ) -> Result<tokio::sync::watch::Receiver<InboundServer>> {
+    fn get_pod_server(&mut self, name: &str, port: u16) -> Result<watch::Receiver<InboundServer>> {
         let pod = self
             .pods
             .get_mut(name)
@@ -418,9 +441,9 @@ impl NamespaceIndex {
     }
 }
 
-// === impl PodMeta ===
+// === impl PodIndex ===
 
-impl PodMeta {
+impl PodIndex {
     fn get_ports_by_name(&mut self, port_ref: &Port) -> Vec<u16> {
         match port_ref {
             Port::Number(p) => Some(*p).into_iter().collect(),
@@ -438,48 +461,47 @@ impl PodMeta {
         match self.port_servers.entry(port) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
-                let (tx, rx) =
-                    tokio::sync::watch::channel(Self::default_server(self.default_policy, config));
+                let (tx, rx) = watch::channel(default_server(self.default_policy, config));
                 entry.insert(PodPortServer { name: None, tx, rx })
             }
         }
     }
+}
 
-    fn default_server(policy: DefaultPolicy, config: &ClusterInfo) -> InboundServer {
-        let mut authorizations = HashMap::default();
-        if let DefaultPolicy::Allow {
-            authenticated_only,
-            cluster_only,
-        } = policy
-        {
-            let authentication = if authenticated_only {
-                ClientAuthentication::TlsAuthenticated(vec![IdentityMatch::Suffix(vec![])])
-            } else {
-                ClientAuthentication::Unauthenticated
-            };
-            let networks = if cluster_only {
-                config.networks.iter().copied().map(Into::into).collect()
-            } else {
-                vec![
-                    "0.0.0.0/0".parse::<IpNet>().unwrap().into(),
-                    "::/0".parse::<IpNet>().unwrap().into(),
-                ]
-            };
-            authorizations.insert(
-                format!("default:{}", policy),
-                ClientAuthorization {
-                    authentication,
-                    networks,
-                },
-            );
+fn default_server(policy: DefaultPolicy, config: &ClusterInfo) -> InboundServer {
+    let mut authorizations = HashMap::default();
+    if let DefaultPolicy::Allow {
+        authenticated_only,
+        cluster_only,
+    } = policy
+    {
+        let authentication = if authenticated_only {
+            ClientAuthentication::TlsAuthenticated(vec![IdentityMatch::Suffix(vec![])])
+        } else {
+            ClientAuthentication::Unauthenticated
         };
-
-        InboundServer {
-            name: format!("default:{}", policy),
-            protocol: ProxyProtocol::Detect {
-                timeout: config.default_detect_timeout,
+        let networks = if cluster_only {
+            config.networks.iter().copied().map(Into::into).collect()
+        } else {
+            vec![
+                "0.0.0.0/0".parse::<IpNet>().unwrap().into(),
+                "::/0".parse::<IpNet>().unwrap().into(),
+            ]
+        };
+        authorizations.insert(
+            format!("default:{}", policy),
+            ClientAuthorization {
+                authentication,
+                networks,
             },
-            authorizations,
-        }
+        );
+    };
+
+    InboundServer {
+        name: format!("default:{}", policy),
+        protocol: ProxyProtocol::Detect {
+            timeout: config.default_detect_timeout,
+        },
+        authorizations,
     }
 }

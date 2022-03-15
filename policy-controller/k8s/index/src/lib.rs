@@ -26,7 +26,6 @@
 
 #![deny(warnings, rust_2018_idioms)]
 #![forbid(unsafe_code)]
-#![allow(dead_code, unused_variables)]
 
 mod defaults;
 
@@ -296,7 +295,7 @@ impl NamespaceIndex {
             tracing::trace!(server = %srvname, "reindexing");
             let server = self.mk_inbound_server(srvname.to_string(), srv);
 
-            for (podname, pod) in self.pods.iter_mut() {
+            for pod in self.pods.values_mut() {
                 if srv.pod_selector.matches(&pod.labels) {
                     tracing::trace!(server = %srvname, %pod.name, "adding server to pod");
                     // A server may select more than one port on a pod.

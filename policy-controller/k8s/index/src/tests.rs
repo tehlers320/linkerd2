@@ -536,6 +536,7 @@ async fn authenticated_annotated() {
 
 // === Helpers ===
 
+#[cfg(feature = "fixme")]
 const DEFAULTS: [DefaultPolicy; 5] = [
     DefaultPolicy::Deny,
     DefaultPolicy::Allow {

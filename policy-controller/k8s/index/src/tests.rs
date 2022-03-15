@@ -1,9 +1,10 @@
-use super::*;
+use crate::{defaults::DefaultPolicy, index::*, ClusterInfo};
 use ahash::AHashMap as HashMap;
 use linkerd_policy_controller_core::{
-    ClientAuthentication, ClientAuthorization, IdentityMatch, IpNet, Ipv4Net, Ipv6Net,
-    NetworkMatch, ProxyProtocol,
+    ClientAuthentication, ClientAuthorization, IdentityMatch, InboundServer, IpNet, Ipv4Net,
+    Ipv6Net, NetworkMatch, ProxyProtocol,
 };
+use linkerd_policy_controller_k8s_api::policy::server::Port;
 use tokio::time;
 
 #[test]

@@ -223,6 +223,51 @@ fn links_server_authz_by_label() {
     );
 }
 
+#[test]
+fn updates_default_server() {
+    let test = TestConfig::default();
+
+    let default_policy = test.default_policy;
+    assert!(test
+        .with_ns_reindexed("ns-0", |ns| {
+            ns.apply_pod(
+                "pod-0",
+                Some(("app", "app-0")).into_iter().collect(),
+                HashMap::default(),
+                default_policy,
+            )
+        })
+        .expect("port names are not changing"));
+
+    let mut rx = test
+        .index
+        .write()
+        .get_pod_server("ns-0", "pod-0", 8080)
+        .expect("pod-0.ns-0 should exist");
+    assert_eq!(*rx.borrow_and_update(), test.default_server());
+
+    assert!(test
+        .with_ns_reindexed("ns-0", |ns| {
+            ns.apply_pod(
+                "pod-0",
+                Some(("app", "app-0")).into_iter().collect(),
+                HashMap::default(),
+                DefaultPolicy::Deny,
+            )
+        })
+        .expect("port names are not changing"));
+    assert_eq!(
+        *rx.borrow_and_update(),
+        InboundServer {
+            name: "default:deny".to_string(),
+            protocol: ProxyProtocol::Detect {
+                timeout: time::Duration::from_secs(1),
+            },
+            authorizations: Default::default()
+        }
+    );
+}
+
 #[cfg(feature = "fixme")]
 #[tokio::test]
 async fn server_update_deselects_pod() {

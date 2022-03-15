@@ -73,10 +73,10 @@ pub struct Index {
     /// Holds per-namespace pod/server/authorization indexes.
     namespaces: HashMap<String, NamespaceIndex>,
 
-    cluster_info: ClusterInfo,
+    cluster_info: Arc<ClusterInfo>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct NamespaceIndex {
     /// Holds per-pod port indexes.
     pods: HashMap<String, PodMeta>,
@@ -86,6 +86,8 @@ pub struct NamespaceIndex {
 
     /// Holds server authorizations by-name
     server_authorizations: HashMap<String, ServerAuthorizationMeta>,
+
+    cluster_info: Arc<ClusterInfo>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -129,7 +131,7 @@ struct ServerAuthorizationMeta {
 impl Index {
     pub fn shared(cluster_info: ClusterInfo) -> SharedIndex {
         Arc::new(RwLock::new(Self {
-            cluster_info,
+            cluster_info: Arc::new(cluster_info),
             namespaces: HashMap::default(),
         }))
     }
@@ -139,7 +141,14 @@ impl Index {
     }
 
     pub fn get_ns_or_default(&mut self, ns: impl ToString) -> &mut NamespaceIndex {
-        self.namespaces.entry(ns.to_string()).or_default()
+        self.namespaces
+            .entry(ns.to_string())
+            .or_insert_with(|| NamespaceIndex {
+                cluster_info: self.cluster_info.clone(),
+                pods: HashMap::default(),
+                servers: HashMap::default(),
+                server_authorizations: HashMap::default(),
+            })
     }
 
     pub fn get_pod_server(
@@ -152,7 +161,7 @@ impl Index {
             .namespaces
             .get_mut(ns)
             .ok_or_else(|| anyhow::anyhow!("namespace not found: {}", ns))?;
-        ns.get_pod_server(pod, port, &self.cluster_info)
+        ns.get_pod_server(pod, port)
     }
 }
 
@@ -176,16 +185,18 @@ impl NamespaceIndex {
                 if pod.port_names != port_names {
                     anyhow::bail!("pod {} port names must not change", name.to_string());
                 }
+
+                let mut changed = false;
                 if pod.default_policy != default_policy {
-                    anyhow::bail!("pod {} default policy must not change", name.to_string());
+                    pod.default_policy = default_policy;
+                    changed = true;
                 }
 
-                if pod.labels == labels {
-                    Ok(false)
-                } else {
+                if pod.labels != labels {
                     pod.labels = labels;
-                    Ok(true)
+                    changed = true;
                 }
+                Ok(changed)
             }
 
             Entry::Vacant(entry) => {
@@ -319,6 +330,18 @@ impl NamespaceIndex {
                 }
             }
         }
+
+        // Ensure that all pods have the correct default policy.
+        for pod in self.pods.values_mut() {
+            for ps in pod.port_servers.values_mut() {
+                if ps.name.is_none()
+                    && *ps.rx.borrow().name != format!("default:{}", pod.default_policy)
+                {
+                    let server = PodMeta::default_server(pod.default_policy, &*self.cluster_info);
+                    ps.tx.send(server).expect("receiver is held");
+                }
+            }
+        }
     }
 
     fn associate_pod_with_server(
@@ -328,8 +351,8 @@ impl NamespaceIndex {
         servers: &HashMap<String, ServerMeta>,
     ) -> Result<bool> {
         match pod.port_servers.entry(port) {
-            Entry::Occupied(entry) => {
-                let ps = entry.get();
+            Entry::Occupied(mut entry) => {
+                let ps = entry.get_mut();
                 if *ps.rx.borrow() == *server {
                     return Ok(false);
                 }
@@ -346,6 +369,7 @@ impl NamespaceIndex {
                     }
                 }
 
+                ps.name = Some(server.name.clone());
                 ps.tx
                     .send(server.clone())
                     .expect("a receiver is held by the index");
@@ -387,17 +411,12 @@ impl NamespaceIndex {
     /// If the pod does not exist, an error is returned.
     ///
     /// If the port is not known, a default server is created.
-    fn get_pod_server(
-        &mut self,
-        name: &str,
-        port: u16,
-        config: &ClusterInfo,
-    ) -> Result<watch::Receiver<InboundServer>> {
+    fn get_pod_server(&mut self, name: &str, port: u16) -> Result<watch::Receiver<InboundServer>> {
         let pod = self
             .pods
             .get_mut(name)
             .ok_or_else(|| anyhow::anyhow!("pod {} not found", name))?;
-        Ok(pod.get_or_default(port, config).rx.clone())
+        Ok(pod.get_or_default(port, &*self.cluster_info).rx.clone())
     }
 }
 
@@ -418,43 +437,50 @@ impl PodMeta {
     }
 
     fn get_or_default(&mut self, port: u16, config: &ClusterInfo) -> &mut PodPortServer {
-        self.port_servers.entry(port).or_insert_with(|| {
-            let mut authorizations = HashMap::default();
-            if let DefaultPolicy::Allow {
-                authenticated_only,
-                cluster_only,
-            } = self.default_policy
-            {
-                let authentication = if authenticated_only {
-                    ClientAuthentication::TlsAuthenticated(vec![IdentityMatch::Suffix(vec![])])
-                } else {
-                    ClientAuthentication::Unauthenticated
-                };
-                let networks = if cluster_only {
-                    config.networks.iter().copied().map(Into::into).collect()
-                } else {
-                    vec![
-                        "0.0.0.0/0".parse::<IpNet>().unwrap().into(),
-                        "::/0".parse::<IpNet>().unwrap().into(),
-                    ]
-                };
-                authorizations.insert(
-                    format!("default:{}", self.default_policy),
-                    ClientAuthorization {
-                        authentication,
-                        networks,
-                    },
-                );
-            };
+        match self.port_servers.entry(port) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let (tx, rx) = watch::channel(Self::default_server(self.default_policy, config));
+                entry.insert(PodPortServer { name: None, tx, rx })
+            }
+        }
+    }
 
-            let (tx, rx) = watch::channel(InboundServer {
-                name: format!("default:{}", self.default_policy),
-                protocol: ProxyProtocol::Detect {
-                    timeout: tokio::time::Duration::from_secs(1), // FIXME
+    fn default_server(policy: DefaultPolicy, config: &ClusterInfo) -> InboundServer {
+        let mut authorizations = HashMap::default();
+        if let DefaultPolicy::Allow {
+            authenticated_only,
+            cluster_only,
+        } = policy
+        {
+            let authentication = if authenticated_only {
+                ClientAuthentication::TlsAuthenticated(vec![IdentityMatch::Suffix(vec![])])
+            } else {
+                ClientAuthentication::Unauthenticated
+            };
+            let networks = if cluster_only {
+                config.networks.iter().copied().map(Into::into).collect()
+            } else {
+                vec![
+                    "0.0.0.0/0".parse::<IpNet>().unwrap().into(),
+                    "::/0".parse::<IpNet>().unwrap().into(),
+                ]
+            };
+            authorizations.insert(
+                format!("default:{}", policy),
+                ClientAuthorization {
+                    authentication,
+                    networks,
                 },
-                authorizations,
-            });
-            PodPortServer { name: None, tx, rx }
-        })
+            );
+        };
+
+        InboundServer {
+            name: format!("default:{}", policy),
+            protocol: ProxyProtocol::Detect {
+                timeout: config.default_detect_timeout,
+            },
+            authorizations,
+        }
     }
 }

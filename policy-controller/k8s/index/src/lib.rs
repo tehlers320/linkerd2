@@ -42,10 +42,12 @@ pub use self::defaults::DefaultPolicy;
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use anyhow::Result;
 use k8s::policy::server::Port;
-use linkerd_policy_controller_core::{ClientAuthorization, InboundServer, IpNet, ProxyProtocol};
+use linkerd_policy_controller_core::{
+    ClientAuthentication, ClientAuthorization, IdentityMatch, InboundServer, IpNet, ProxyProtocol,
+};
 use linkerd_policy_controller_k8s_api as k8s;
 use parking_lot::RwLock;
-use std::{collections::hash_map, sync::Arc};
+use std::{collections::hash_map::Entry, sync::Arc};
 use tokio::{sync::watch, time};
 
 // /// Watches a server's configuration for server/authorization changes.
@@ -94,7 +96,7 @@ pub struct Index {
     default_policy: DefaultPolicy,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct NamespaceIndex {
     /// Holds per-pod port indexes.
     pods: HashMap<String, PodMeta>,
@@ -112,11 +114,13 @@ pub enum ServerSelector {
     Selector(k8s::labels::Selector),
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PodMeta {
+    name: String,
     labels: k8s::Labels,
     port_names: HashMap<String, HashSet<u16>>,
     port_servers: HashMap<u16, PodPortServer>,
+    default_policy: DefaultPolicy,
 }
 
 #[derive(Debug)]
@@ -163,6 +167,10 @@ impl Index {
     pub fn get_ns(&self, ns: &str) -> Option<&NamespaceIndex> {
         self.namespaces.get(ns)
     }
+
+    pub fn get_ns_or_default_mut(&mut self, ns: impl ToString) -> &mut NamespaceIndex {
+        self.namespaces.entry(ns.to_string()).or_default()
+    }
 }
 
 impl NamespaceIndex {
@@ -176,14 +184,17 @@ impl NamespaceIndex {
         name: impl ToString,
         labels: k8s::Labels,
         port_names: HashMap<String, HashSet<u16>>,
+        default_policy: DefaultPolicy,
     ) -> Result<bool> {
         match self.pods.entry(name.to_string()) {
-            hash_map::Entry::Occupied(pod) => {
+            // Pod labels may change at runtime but the default policy and port sets may not.
+            Entry::Occupied(pod) => {
                 let pod = pod.into_mut();
                 if pod.port_names != port_names {
-                    // This would indicate that the pod's port list is mutated after it's created,
-                    // which is impossible.
-                    anyhow::bail!("pod {} port names changed", name.to_string());
+                    anyhow::bail!("pod {} port names must not change", name.to_string());
+                }
+                if pod.default_policy != default_policy {
+                    anyhow::bail!("pod {} default policy must not change", name.to_string());
                 }
 
                 if pod.labels == labels {
@@ -193,10 +204,14 @@ impl NamespaceIndex {
                     Ok(true)
                 }
             }
-            hash_map::Entry::Vacant(entry) => {
+
+            Entry::Vacant(entry) => {
+                let name = entry.key().to_string();
                 entry.insert(PodMeta {
+                    name,
                     labels,
                     port_names,
+                    default_policy,
                     port_servers: HashMap::default(),
                 });
                 Ok(true)
@@ -229,7 +244,7 @@ impl NamespaceIndex {
             protocol,
         };
         match self.servers.entry(name.to_string()) {
-            hash_map::Entry::Occupied(entry) => {
+            Entry::Occupied(entry) => {
                 let srv = entry.into_mut();
                 if *srv == meta {
                     false
@@ -238,7 +253,7 @@ impl NamespaceIndex {
                     true
                 }
             }
-            hash_map::Entry::Vacant(entry) => {
+            Entry::Vacant(entry) => {
                 entry.insert(meta);
                 true
             }
@@ -254,7 +269,8 @@ impl NamespaceIndex {
 
     /// Adds or updates a ServerAuthorization.
     ///
-    /// Returns true if the ServerAuthorization was updated and false if it already existed and was unchanged.
+    /// Returns true if the ServerAuthorization was updated and false if it already existed and was
+    /// unchanged.
     pub fn apply_server_authorization(
         &mut self,
         name: impl ToString,
@@ -266,7 +282,7 @@ impl NamespaceIndex {
             server_selector,
         };
         match self.server_authorizations.entry(name.to_string()) {
-            hash_map::Entry::Occupied(entry) => {
+            Entry::Occupied(entry) => {
                 let saz = entry.into_mut();
                 if *saz == meta {
                     false
@@ -275,7 +291,7 @@ impl NamespaceIndex {
                     true
                 }
             }
-            hash_map::Entry::Vacant(entry) => {
+            Entry::Vacant(entry) => {
                 entry.insert(meta);
                 true
             }
@@ -293,60 +309,22 @@ impl NamespaceIndex {
     pub fn reindex(&mut self) -> bool {
         let mut updated = false;
 
-        for (srvname, srvmeta) in self.servers.iter() {
-            let server = {
-                let mut authorizations = HashMap::with_capacity(self.server_authorizations.len());
-                for (sazname, sazmeta) in self.server_authorizations.iter() {
-                    let matched = match sazmeta.server_selector {
-                        ServerSelector::Name(ref n) => n == srvname,
-                        ServerSelector::Selector(ref selector) => selector.matches(&srvmeta.labels),
-                    };
-                    if matched {
-                        authorizations.insert(sazname.clone(), sazmeta.authz.clone());
-                    }
-                }
-                InboundServer {
-                    name: srvname.clone(),
-                    protocol: srvmeta.protocol.clone(),
-                    authorizations,
-                }
-            };
+        for (srvname, srv) in self.servers.iter() {
+            let server = self.mk_inbound_server(srvname.to_string(), srv);
 
-            for (podname, podmeta) in self.pods.iter_mut() {
-                if srvmeta.pod_selector.matches(&podmeta.labels) {
-                    for port in podmeta.get_ports(&srvmeta.port_ref).into_iter() {
-                        match podmeta.port_servers.entry(port) {
-                            hash_map::Entry::Occupied(entry) => {
-                                let ps = entry.get();
-                                if *ps.rx.borrow() != server {
-                                    if let Some(psn) = ps.name.as_deref() {
-                                        if psn != server.name && self.servers.contains_key(psn) {
-                                            tracing::warn!(
-                                                "Both {} and {} select pod {} on port {}",
-                                                psn,
-                                                server.name,
-                                                podname,
-                                                port,
-                                            );
-                                            continue;
-                                        }
-                                    }
-                                    ps.tx
-                                        .send(server.clone())
-                                        .expect("at least one receiver must be held");
-                                    updated = true;
-                                }
+            for (podname, pod) in self.pods.iter_mut() {
+                if srv.pod_selector.matches(&pod.labels) {
+                    // A server may select more than one port on a pod.
+                    for port in pod.get_ports_by_name(&srv.port_ref).into_iter() {
+                        match Self::associate_pod_with_server(pod, port, &server, &self.servers) {
+                            Ok(changed) => {
+                                updated = updated || changed;
                             }
-                            hash_map::Entry::Vacant(entry) => {
-                                let (tx, rx) = watch::channel(server.clone());
-                                entry.insert(PodPortServer {
-                                    name: Some(podname.clone()),
-                                    tx,
-                                    rx,
-                                });
-                                updated = true;
+                            Err(error) => {
+                                tracing::warn!(%error);
+                                continue;
                             }
-                        }
+                        };
                     }
                 }
             }
@@ -355,17 +333,85 @@ impl NamespaceIndex {
         updated
     }
 
-    // TODO: We should provide a way for the gRPC server to initiate a watch, even if the server
-    // didn't already have a server for this port. Fails if the pod is not known.
-    pub fn lookup(&mut self, name: &str, port: u16) -> Result<watch::Receiver<InboundServer>> {
-        unimplemented!()
+    fn associate_pod_with_server(
+        pod: &mut PodMeta,
+        port: u16,
+        server: &InboundServer,
+        servers: &HashMap<String, ServerMeta>,
+    ) -> Result<bool> {
+        match pod.port_servers.entry(port) {
+            Entry::Occupied(entry) => {
+                let ps = entry.get();
+                if *ps.rx.borrow() == *server {
+                    return Ok(false);
+                }
+
+                if let Some(psn) = ps.name.as_deref() {
+                    if psn != server.name && servers.contains_key(psn) {
+                        anyhow::bail!(
+                            "both {} and {} select {}:{}",
+                            psn,
+                            server.name,
+                            pod.name,
+                            port,
+                        );
+                    }
+                }
+
+                ps.tx
+                    .send(server.clone())
+                    .expect("a receiver is held by the index");
+                Ok(true)
+            }
+
+            Entry::Vacant(entry) => {
+                let (tx, rx) = watch::channel(server.clone());
+                entry.insert(PodPortServer {
+                    name: Some(server.name.clone()),
+                    tx,
+                    rx,
+                });
+                Ok(true)
+            }
+        }
+    }
+
+    fn mk_inbound_server(&self, name: String, server: &ServerMeta) -> InboundServer {
+        let mut authorizations = HashMap::with_capacity(self.server_authorizations.len());
+        for (sazname, saz) in self.server_authorizations.iter() {
+            let matched = match &saz.server_selector {
+                ServerSelector::Name(n) => *n == name,
+                ServerSelector::Selector(selector) => selector.matches(&server.labels),
+            };
+            if matched {
+                authorizations.insert(sazname.to_string(), saz.authz.clone());
+            }
+        }
+        InboundServer {
+            name,
+            protocol: server.protocol.clone(),
+            authorizations,
+        }
+    }
+
+    /// Attempts to find a Server for the given pod and port.
+    ///
+    /// If the pod does not exist, an error is returned.
+    ///
+    /// If the port is not known, a default server is created.
+    pub fn get_server(&mut self, name: &str, port: u16) -> Result<watch::Receiver<InboundServer>> {
+        let pod = self
+            .pods
+            .get_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("pod {} not found", name))?;
+        Ok(pod.get_or_default(port).rx.clone())
     }
 }
 
 // === impl PodMeta ===
 
 impl PodMeta {
-    fn get_ports(&mut self, port_ref: &Port) -> Vec<u16> {
+    fn get_ports_by_name(&mut self, port_ref: &Port) -> Vec<u16> {
         match port_ref {
             Port::Number(p) => Some(*p).into_iter().collect(),
             Port::Name(name) => self
@@ -376,5 +422,45 @@ impl PodMeta {
                 .flatten()
                 .collect(),
         }
+    }
+
+    fn get_or_default(&mut self, port: u16) -> &mut PodPortServer {
+        self.port_servers.entry(port).or_insert_with(|| {
+            let mut authorizations = HashMap::default();
+            if let DefaultPolicy::Allow {
+                authenticated_only,
+                cluster_only,
+            } = self.default_policy
+            {
+                let authentication = if authenticated_only {
+                    ClientAuthentication::TlsAuthenticated(vec![IdentityMatch::Suffix(vec![])])
+                } else {
+                    ClientAuthentication::Unauthenticated
+                };
+                let mut networks = Vec::with_capacity(2);
+                if cluster_only {
+                    unimplemented!("FIXME get cluster networks");
+                } else {
+                    networks.push("0.0.0.0/0".parse::<IpNet>().unwrap().into());
+                    networks.push("::/0".parse::<IpNet>().unwrap().into());
+                }
+                authorizations.insert(
+                    self.default_policy.to_string(),
+                    ClientAuthorization {
+                        authentication,
+                        networks,
+                    },
+                );
+            };
+
+            let (tx, rx) = watch::channel(InboundServer {
+                name: self.default_policy.to_string(),
+                protocol: ProxyProtocol::Detect {
+                    timeout: tokio::time::Duration::from_secs(1), // FIXME
+                },
+                authorizations,
+            });
+            PodPortServer { name: None, tx, rx }
+        })
     }
 }

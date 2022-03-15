@@ -633,8 +633,8 @@ struct TestConfig {
 impl TestConfig {
     fn with_ns_reindexed<T>(&self, ns: &str, f: impl FnOnce(&mut NamespaceIndex) -> T) -> T {
         let mut idx = self.index.write();
-        let mut ns = idx.get_ns_or_default(ns);
-        let t = f(&mut ns);
+        let ns = idx.get_ns_or_default(ns);
+        let t = f(ns);
         ns.reindex();
         t
     }

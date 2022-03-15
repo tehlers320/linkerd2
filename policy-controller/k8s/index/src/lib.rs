@@ -29,11 +29,6 @@
 #![allow(dead_code, unused_variables)]
 
 mod defaults;
-// mod lookup;
-// mod namespace;
-// pub mod pod;
-// pub mod server;
-// pub mod server_authorization;
 
 #[cfg(test)]
 mod tests;
@@ -63,6 +58,12 @@ pub struct ClusterInfo {
 
     /// The cluster's mesh identity trust domain.
     pub identity_domain: String,
+
+    /// The cluster-wide default policy.
+    pub default_policy: DefaultPolicy,
+
+    /// The cluster-wide default protocol detection timeout.
+    pub default_detect_timeout: time::Duration,
 }
 
 pub type SharedIndex = Arc<RwLock<Index>>;
@@ -74,14 +75,6 @@ pub struct Index {
     namespaces: HashMap<String, NamespaceIndex>,
 
     cluster_info: ClusterInfo,
-
-    /*
-        /// Holds watches for the cluster's default-allow policies. These watches are never updated but
-        /// this state is held so we can used shared references when updating a pod-port's server watch
-        /// with a default policy.
-        default_policy_watches: DefaultPolicyWatches,
-    */
-    default_policy: DefaultPolicy,
 }
 
 #[derive(Debug, Default)]
@@ -135,19 +128,9 @@ struct ServerAuthorizationMeta {
 // === impl Index ===
 
 impl Index {
-    pub fn shared(
-        cluster_info: ClusterInfo,
-        default_policy: DefaultPolicy,
-        detect_timeout: time::Duration,
-    ) -> SharedIndex {
-        // // Create a common set of receivers for all supported default policies.
-        // let default_policy_watches =
-        //     DefaultPolicyWatches::new(cluster_info.networks.clone(), detect_timeout);
-
+    pub fn shared(cluster_info: ClusterInfo) -> SharedIndex {
         Arc::new(RwLock::new(Self {
             cluster_info,
-            default_policy,
-            //default_policy_watches,
             namespaces: HashMap::default(),
         }))
     }

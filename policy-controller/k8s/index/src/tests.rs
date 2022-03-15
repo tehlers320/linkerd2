@@ -654,17 +654,19 @@ impl Default for TestConfig {
     fn default() -> TestConfig {
         let _tracing = init_tracing();
         let cluster_net = "192.0.2.0/24".parse().unwrap();
-        let cluster = ClusterInfo {
-            networks: vec![cluster_net],
-            control_plane_ns: "linkerd".to_string(),
-            identity_domain: "cluster.example.com".into(),
-        };
         let detect_timeout = time::Duration::from_secs(1);
         let default_policy = DefaultPolicy::Allow {
             authenticated_only: false,
             cluster_only: true,
         };
-        let index = Index::shared(cluster.clone(), default_policy, detect_timeout);
+        let cluster = ClusterInfo {
+            networks: vec![cluster_net],
+            control_plane_ns: "linkerd".to_string(),
+            identity_domain: "cluster.example.com".into(),
+            default_policy,
+            default_detect_timeout: detect_timeout,
+        };
+        let index = Index::shared(cluster.clone());
         Self {
             index,
             cluster,

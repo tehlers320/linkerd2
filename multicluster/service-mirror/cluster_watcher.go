@@ -697,6 +697,30 @@ func (rcsw *RemoteClusterServiceWatcher) getMirrorServices() (*corev1.ServiceLis
 	return services, nil
 }
 
+// resetEndpointsToReady takes an endpoints object and sets each subset of
+// addresses to point to the gateway as ready. The call to
+// createOrUpdateEndpoints ensures that if the gateway is not alive, these
+// addresses are transitioned back to not ready.
+//
+// This is useful when repairing endpoints and allowing for previously not
+// ready addresses to properly be set to ready if the gateway is now alive.
+func (rcsw *RemoteClusterServiceWatcher) resetEndpointsToReady(ctx context.Context, endpoints *corev1.Endpoints) error {
+	gatewayAddresses, err := rcsw.resolveGatewayAddress()
+	if err != nil {
+		rcsw.log.Errorf("Failed to resolve gateway addresses: %s", err)
+		return nil
+	}
+	for i := range endpoints.Subsets {
+		endpoints.Subsets[i].Addresses = gatewayAddresses
+		endpoints.Subsets[i].NotReadyAddresses = nil
+	}
+	err = rcsw.createOrUpdateEndpoints(ctx, endpoints)
+	if err != nil {
+		return RetryableError{[]error{err}}
+	}
+	return nil
+}
+
 func (rcsw *RemoteClusterServiceWatcher) handleOnDelete(service *corev1.Service) {
 	if rcsw.isExportedService(service) {
 		rcsw.eventsQueue.Add(&RemoteServiceDeleted{
@@ -959,20 +983,7 @@ func (rcsw *RemoteClusterServiceWatcher) repairEndpoints(ctx context.Context) er
 				rcsw.log.Debugf("Skipped repairing mirror endpoints for headless mirror %s/%s", svc.Namespace, svc.Name)
 				continue
 			}
-			gatewayAddresses, err := rcsw.resolveGatewayAddress()
-			if err != nil {
-				rcsw.log.Errorf("Failed to resolve gateway addresses: %s", err)
-				continue
-			}
-			for i := range endpoints.Subsets {
-				endpoints.Subsets[i].Addresses = gatewayAddresses
-				endpoints.Subsets[i].NotReadyAddresses = nil
-			}
-			err = rcsw.createOrUpdateEndpoints(ctx, endpoints)
-			if err != nil {
-				return RetryableError{[]error{err}}
-			}
-			continue
+			return rcsw.resetEndpointsToReady(ctx, endpoints)
 		}
 
 		endpoints, err := rcsw.localAPIClient.Endpoint().Lister().Endpoints(svc.Namespace).Get(svc.Name)

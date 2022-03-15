@@ -324,7 +324,12 @@ impl NamespaceIndex {
 
     /// Reindex all pod-server-authorization relationships.
     pub fn reindex(&mut self) {
-        tracing::trace!(servers = %self.servers.len(), "reindexing");
+        tracing::debug!(
+            pods = %self.pods.len(),
+            servers = %self.servers.len(), server_authorizations = %self.server_authorizations.len(),
+            "reindexing",
+        );
+
         for (srvname, srv) in self.servers.iter() {
             tracing::trace!(server = %srvname, "reindexing");
             let server = self.mk_inbound_server(srvname.to_string(), srv);

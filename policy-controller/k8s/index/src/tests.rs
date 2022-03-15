@@ -19,7 +19,6 @@ fn pod_must_exist_for_lookup() {
 fn links_named_server_port() {
     let test = TestConfig::default();
 
-    let default_policy = test.default_policy;
     test.with_ns_reindexed("ns-0", |ns| {
         let mut ports = HashMap::with_capacity(1);
         ports.insert("admin-http".to_string(), Some(8080).into_iter().collect());
@@ -27,7 +26,7 @@ fn links_named_server_port() {
             "pod-0",
             Some(("app", "app-0")).into_iter().collect(),
             ports,
-            default_policy,
+            None,
         )
     })
     .expect("pod-0.ns-0 should not already exist");
@@ -61,13 +60,12 @@ fn links_named_server_port() {
 fn links_unnamed_server_port() {
     let test = TestConfig::default();
 
-    let default_policy = test.default_policy;
     test.with_ns_reindexed("ns-0", |ns| {
         ns.apply_pod(
             "pod-0",
             Some(("app", "app-0")).into_iter().collect(),
             HashMap::default(),
-            default_policy,
+            None,
         )
     })
     .expect("pod-0.ns-0 should not already exist");
@@ -101,13 +99,12 @@ fn links_unnamed_server_port() {
 fn links_server_authz_by_name() {
     let test = TestConfig::default();
 
-    let default_policy = test.default_policy;
     test.with_ns_reindexed("ns-0", |ns| {
         ns.apply_pod(
             "pod-0",
             Some(("app", "app-0")).into_iter().collect(),
             HashMap::default(),
-            default_policy,
+            None,
         )
     })
     .expect("pod-0.ns-0 should not already exist");
@@ -164,13 +161,12 @@ fn links_server_authz_by_name() {
 fn links_server_authz_by_label() {
     let test = TestConfig::default();
 
-    let default_policy = test.default_policy;
     test.with_ns_reindexed("ns-0", |ns| {
         ns.apply_pod(
             "pod-0",
             Some(("app", "app-0")).into_iter().collect(),
             HashMap::default(),
-            default_policy,
+            None,
         )
     })
     .expect("pod-0.ns-0 should not already exist");
@@ -227,14 +223,13 @@ fn links_server_authz_by_label() {
 fn updates_default_server() {
     let test = TestConfig::default();
 
-    let default_policy = test.default_policy;
     assert!(test
         .with_ns_reindexed("ns-0", |ns| {
             ns.apply_pod(
                 "pod-0",
                 Some(("app", "app-0")).into_iter().collect(),
                 HashMap::default(),
-                default_policy,
+                None,
             )
         })
         .expect("port names are not changing"));
@@ -252,7 +247,7 @@ fn updates_default_server() {
                 "pod-0",
                 Some(("app", "app-0")).into_iter().collect(),
                 HashMap::default(),
-                DefaultPolicy::Deny,
+                Some(DefaultPolicy::Deny),
             )
         })
         .expect("port names are not changing"));

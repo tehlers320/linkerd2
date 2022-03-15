@@ -28,6 +28,7 @@
 #![forbid(unsafe_code)]
 
 mod defaults;
+pub mod watch;
 
 #[cfg(test)]
 mod tests;
@@ -42,7 +43,7 @@ use linkerd_policy_controller_core::{
 use linkerd_policy_controller_k8s_api as k8s;
 use parking_lot::RwLock;
 use std::{collections::hash_map::Entry, sync::Arc};
-use tokio::{sync::watch, time};
+use tokio::time;
 
 /// Holds cluster metadata.
 #[derive(Clone, Debug)]
@@ -108,8 +109,8 @@ struct PodMeta {
 #[derive(Debug)]
 struct PodPortServer {
     name: Option<String>,
-    tx: watch::Sender<InboundServer>,
-    rx: watch::Receiver<InboundServer>,
+    tx: tokio::sync::watch::Sender<InboundServer>,
+    rx: tokio::sync::watch::Receiver<InboundServer>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -140,6 +141,14 @@ impl Index {
         self.namespaces.get(ns)
     }
 
+    pub fn get_ns_mut(&mut self, ns: &str) -> Option<&mut NamespaceIndex> {
+        self.namespaces.get_mut(ns)
+    }
+
+    pub fn entry(&mut self, ns: String) -> Entry<'_, String, NamespaceIndex> {
+        self.namespaces.entry(ns)
+    }
+
     pub fn get_ns_or_default(&mut self, ns: impl ToString) -> &mut NamespaceIndex {
         self.namespaces
             .entry(ns.to_string())
@@ -156,16 +165,28 @@ impl Index {
         ns: &str,
         pod: &str,
         port: u16,
-    ) -> Result<watch::Receiver<InboundServer>> {
+    ) -> Result<tokio::sync::watch::Receiver<InboundServer>> {
         let ns = self
             .namespaces
             .get_mut(ns)
             .ok_or_else(|| anyhow::anyhow!("namespace not found: {}", ns))?;
         ns.get_pod_server(pod, port)
     }
+
+    pub fn dump_pods(&self) -> HashMap<String, HashSet<String>> {
+        let mut dump = HashMap::default();
+        for (ns, idx) in self.namespaces.iter() {
+            dump.insert(ns.clone(), idx.pods.keys().map(|n| n.to_string()).collect());
+        }
+        dump
+    }
 }
 
 impl NamespaceIndex {
+    pub fn is_empty(&self) -> bool {
+        self.pods.is_empty() && self.servers.is_empty() && self.server_authorizations.is_empty()
+    }
+
     /// Adds or updates a Pod.
     ///
     /// Labels may be updated but port names may not be updated after a pod is created.
@@ -176,8 +197,10 @@ impl NamespaceIndex {
         name: impl ToString,
         labels: k8s::Labels,
         port_names: HashMap<String, HashSet<u16>>,
-        default_policy: DefaultPolicy,
+        default_policy: Option<DefaultPolicy>,
     ) -> Result<bool> {
+        let default_policy = default_policy.unwrap_or(self.cluster_info.default_policy);
+
         match self.pods.entry(name.to_string()) {
             // Pod labels may change at runtime but the default policy and port sets may not.
             Entry::Occupied(pod) => {
@@ -377,7 +400,7 @@ impl NamespaceIndex {
             }
 
             Entry::Vacant(entry) => {
-                let (tx, rx) = watch::channel(server.clone());
+                let (tx, rx) = tokio::sync::watch::channel(server.clone());
                 entry.insert(PodPortServer {
                     name: Some(server.name.clone()),
                     tx,
@@ -411,7 +434,11 @@ impl NamespaceIndex {
     /// If the pod does not exist, an error is returned.
     ///
     /// If the port is not known, a default server is created.
-    fn get_pod_server(&mut self, name: &str, port: u16) -> Result<watch::Receiver<InboundServer>> {
+    fn get_pod_server(
+        &mut self,
+        name: &str,
+        port: u16,
+    ) -> Result<tokio::sync::watch::Receiver<InboundServer>> {
         let pod = self
             .pods
             .get_mut(name)
@@ -440,7 +467,8 @@ impl PodMeta {
         match self.port_servers.entry(port) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
-                let (tx, rx) = watch::channel(Self::default_server(self.default_policy, config));
+                let (tx, rx) =
+                    tokio::sync::watch::channel(Self::default_server(self.default_policy, config));
                 entry.insert(PodPortServer { name: None, tx, rx })
             }
         }

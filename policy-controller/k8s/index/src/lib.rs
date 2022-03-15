@@ -35,8 +35,8 @@ mod defaults;
 // pub mod server;
 // pub mod server_authorization;
 
-// #[cfg(test)]
-// mod tests;
+#[cfg(test)]
+mod tests;
 
 pub use self::defaults::DefaultPolicy;
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
@@ -49,18 +49,6 @@ use linkerd_policy_controller_k8s_api as k8s;
 use parking_lot::RwLock;
 use std::{collections::hash_map::Entry, sync::Arc};
 use tokio::{sync::watch, time};
-
-// /// Watches a server's configuration for server/authorization changes.
-// type ServerRx = watch::Receiver<InboundServer>;
-
-// /// Publishes updates for a server's configuration for server/authorization changes.
-// type ServerTx = watch::Sender<InboundServer>;
-
-// /// Watches a pod's port for a new `ServerRx`.
-// type PodServerRx = watch::Receiver<ServerRx>;
-
-// /// Publishes a pod's port for a new `ServerRx`.
-// type PodServerTx = watch::Sender<ServerRx>;
 
 /// Holds cluster metadata.
 #[derive(Clone, Debug)]
@@ -168,8 +156,21 @@ impl Index {
         self.namespaces.get(ns)
     }
 
-    pub fn get_ns_or_default_mut(&mut self, ns: impl ToString) -> &mut NamespaceIndex {
+    pub fn get_ns_or_default(&mut self, ns: impl ToString) -> &mut NamespaceIndex {
         self.namespaces.entry(ns.to_string()).or_default()
+    }
+
+    pub fn get_pod_server(
+        &mut self,
+        ns: &str,
+        pod: &str,
+        port: u16,
+    ) -> Result<watch::Receiver<InboundServer>> {
+        let ns = self
+            .namespaces
+            .get_mut(ns)
+            .ok_or_else(|| anyhow::anyhow!("namespace not found: {}", ns))?;
+        ns.get_pod_server(pod, port, &self.cluster_info)
     }
 }
 
@@ -306,31 +307,36 @@ impl NamespaceIndex {
     }
 
     /// Reindex all pod-server-authorization relationships.
-    pub fn reindex(&mut self) -> bool {
-        let mut updated = false;
-
+    pub fn reindex(&mut self) {
+        tracing::trace!(servers = %self.servers.len(), "reindexing");
         for (srvname, srv) in self.servers.iter() {
+            tracing::trace!(server = %srvname, "reindexing");
             let server = self.mk_inbound_server(srvname.to_string(), srv);
 
             for (podname, pod) in self.pods.iter_mut() {
                 if srv.pod_selector.matches(&pod.labels) {
+                    tracing::trace!(server = %srvname, %pod.name, "adding server to pod");
                     // A server may select more than one port on a pod.
                     for port in pod.get_ports_by_name(&srv.port_ref).into_iter() {
-                        match Self::associate_pod_with_server(pod, port, &server, &self.servers) {
-                            Ok(changed) => {
-                                updated = updated || changed;
-                            }
-                            Err(error) => {
-                                tracing::warn!(%error);
-                                continue;
-                            }
+                        tracing::trace!(server = %srvname, %pod.name, %port, "associating server with pod");
+                        if let Err(conflict) =
+                            Self::associate_pod_with_server(pod, port, &server, &self.servers)
+                        {
+                            tracing::warn!(%conflict);
+                            continue;
                         };
                     }
+                } else {
+                    tracing::trace!(
+                        server = %srvname,
+                        selector = ?srv.pod_selector,
+                        %pod.name,
+                        ?pod.labels,
+                        "does not match"
+                    );
                 }
             }
         }
-
-        updated
     }
 
     fn associate_pod_with_server(
@@ -399,12 +405,17 @@ impl NamespaceIndex {
     /// If the pod does not exist, an error is returned.
     ///
     /// If the port is not known, a default server is created.
-    pub fn get_server(&mut self, name: &str, port: u16) -> Result<watch::Receiver<InboundServer>> {
+    fn get_pod_server(
+        &mut self,
+        name: &str,
+        port: u16,
+        config: &ClusterInfo,
+    ) -> Result<watch::Receiver<InboundServer>> {
         let pod = self
             .pods
             .get_mut(name)
             .ok_or_else(|| anyhow::anyhow!("pod {} not found", name))?;
-        Ok(pod.get_or_default(port).rx.clone())
+        Ok(pod.get_or_default(port, config).rx.clone())
     }
 }
 
@@ -424,7 +435,7 @@ impl PodMeta {
         }
     }
 
-    fn get_or_default(&mut self, port: u16) -> &mut PodPortServer {
+    fn get_or_default(&mut self, port: u16, config: &ClusterInfo) -> &mut PodPortServer {
         self.port_servers.entry(port).or_insert_with(|| {
             let mut authorizations = HashMap::default();
             if let DefaultPolicy::Allow {
@@ -437,15 +448,16 @@ impl PodMeta {
                 } else {
                     ClientAuthentication::Unauthenticated
                 };
-                let mut networks = Vec::with_capacity(2);
-                if cluster_only {
-                    unimplemented!("FIXME get cluster networks");
+                let networks = if cluster_only {
+                    config.networks.iter().copied().map(Into::into).collect()
                 } else {
-                    networks.push("0.0.0.0/0".parse::<IpNet>().unwrap().into());
-                    networks.push("::/0".parse::<IpNet>().unwrap().into());
-                }
+                    vec![
+                        "0.0.0.0/0".parse::<IpNet>().unwrap().into(),
+                        "::/0".parse::<IpNet>().unwrap().into(),
+                    ]
+                };
                 authorizations.insert(
-                    self.default_policy.to_string(),
+                    format!("default:{}", self.default_policy),
                     ClientAuthorization {
                         authentication,
                         networks,
@@ -454,7 +466,7 @@ impl PodMeta {
             };
 
             let (tx, rx) = watch::channel(InboundServer {
-                name: self.default_policy.to_string(),
+                name: format!("default:{}", self.default_policy),
                 protocol: ProxyProtocol::Detect {
                     timeout: tokio::time::Duration::from_secs(1), // FIXME
                 },
